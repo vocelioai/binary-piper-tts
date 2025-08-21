@@ -1,44 +1,27 @@
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV TZ=UTC
+# Install minimal dependencies
+RUN apt-get update && \
+    apt-get install -y wget curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir fastapi uvicorn aiofiles
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    espeak-ng \
-    espeak-ng-data \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Copy app files
 COPY . .
 
-# Make models directory
-RUN mkdir -p models
-
-# Download Piper binary and models during build
-RUN wget -O piper.tar.gz "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz" && \
+# Get Piper binary
+RUN wget -q -O piper.tar.gz "https://github.com/rhasspy/piper/releases/latest/download/piper_linux_x86_64.tar.gz" && \
     tar -xzf piper.tar.gz && \
-    mv piper/piper /usr/local/bin/ && \
+    mv piper/piper /usr/local/bin/piper && \
     chmod +x /usr/local/bin/piper && \
-    rm -rf piper.tar.gz piper/ && \
-    python download_models.py
+    rm -rf piper.tar.gz piper/
 
-# Expose port
-EXPOSE 8000
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
-# Health check
-HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+EXPOSE $PORT
 
-# Start the application
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start with minimal models
+CMD python download_models_minimal.py && exec uvicorn app:app --host 0.0.0.0 --port $PORT
