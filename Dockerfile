@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install minimal dependencies
+# Install dependencies including espeak-ng for Piper
 RUN apt-get update && \
-    apt-get install -y wget curl && \
+    apt-get install -y wget curl espeak-ng espeak-ng-data && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir fastapi uvicorn aiofiles
 
