@@ -57,7 +57,7 @@ MODELS_DIR = os.environ.get("MODELS_DIR") or DEFAULT_MODELS_DIR
 DEFAULT_PIPER_BINARY = "/usr/local/bin/piper" if os.name != "nt" else os.path.join(os.path.dirname(__file__), "piper-bin", "piper", "piper.exe")
 PIPER_BINARY = os.environ.get("PIPER_BINARY") or DEFAULT_PIPER_BINARY
 
-MAX_TEXT_LENGTH = 20000  # Increased for call center use - supports long conversations
+MAX_TEXT_LENGTH = 100000  # Extended for long-form content - supports up to 100K characters
 
 logger.info(f"Resolved MODELS_DIR={MODELS_DIR}")
 logger.info(f"Resolved PIPER_BINARY={PIPER_BINARY}")
@@ -302,7 +302,7 @@ async def stream_synthesis_chunks(text_chunks: List[str], voice: str, speaker_id
                 input=chunk,
                 text=True,
                 capture_output=True,
-                timeout=120,  # Shorter timeout for streaming chunks
+                timeout=600,  # Extended timeout for larger chunks (10 minutes)
                 check=False
             )
             
@@ -492,9 +492,9 @@ async def get_configuration():
             "description": f"Standard endpoint supports up to {MAX_TEXT_LENGTH:,} chars. Use /synthesize_long for longer texts."
         },
         "performance": {
-            "timeout_standard": "120-300s (generous, length-based)",
+            "timeout_standard": "300-1800s (extended for long texts)",
             "timeout_long": "180-600s per chunk (very generous)",
-            "timeout_formula": "Standard: 120s + (chars÷50), Long: 180s + (chars÷25)",
+            "timeout_formula": "Standard: 300s + (chars÷25), Long: 180s + (chars÷25)",
             "chunking_enabled": True,
             "max_chunk_size": "4,000 characters",
             "synthesis_logging": "Enabled with timing details"
@@ -504,7 +504,7 @@ async def get_configuration():
             "languages_supported": len(set(voice.language for voice in VOICES_CACHE.values()))
         },
         "endpoints": {
-            "synthesize": "Standard synthesis (up to 20,000 chars)",
+            "synthesize": "Standard synthesis (up to 100,000 chars)",
             "synthesize_long": "Long text synthesis with automatic chunking",
             "voices": "List available voices",
             "health": "Service health check"
@@ -596,8 +596,8 @@ async def synthesize_speech(request: SynthesisRequest):
         logger.info(f"🎵 Synthesizing: '{text[:50]}...' with voice '{request.voice}' (cache miss)")
         
         # Run Piper binary with generous timeout for longer texts
-        # More generous formula: base 120s + extra time for longer texts
-        timeout_duration = min(300, max(120, 120 + (len(text) // 50)))  # 120-300s based on text length
+        # Enhanced formula for up to 100K characters: base 300s + extra time for longer texts
+        timeout_duration = min(1800, max(300, 300 + (len(text) // 25)))  # 300-1800s (5-30 min) based on text length
         logger.info(f"Using timeout: {timeout_duration}s for {len(text)} characters")
         
         start_time = time.time()
