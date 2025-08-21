@@ -11,10 +11,12 @@ RUN apt-get update && \
 # Copy app files
 COPY . .
 
-# Get Piper binary
-RUN wget -q -O piper.tar.gz "https://github.com/rhasspy/piper/releases/latest/download/piper_linux_x86_64.tar.gz" && \
+# Get Piper binary and libraries
+RUN wget -q -O piper.tar.gz "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz" && \
     tar -xzf piper.tar.gz && \
-    mv piper/piper /usr/local/bin/piper && \
+    cp piper/piper /usr/local/bin/ && \
+    cp piper/lib/* /usr/local/lib/ && \
+    ldconfig && \
     chmod +x /usr/local/bin/piper && \
     rm -rf piper.tar.gz piper/
 
