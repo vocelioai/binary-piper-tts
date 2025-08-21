@@ -11,17 +11,20 @@ RUN apt-get update && \
 # Copy app files
 COPY . .
 
-# Get Piper binary and libraries
+# Get Piper binary and libraries - use complete installation
 RUN wget -q -O piper.tar.gz "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz" && \
     tar -xzf piper.tar.gz && \
-    cp piper/piper /usr/local/bin/ && \
-    cp piper/lib/* /usr/local/lib/ && \
+    mkdir -p /opt/piper && \
+    cp -r piper/* /opt/piper/ && \
+    ln -s /opt/piper/piper /usr/local/bin/piper && \
+    chmod +x /opt/piper/piper && \
+    echo "/opt/piper/lib" > /etc/ld.so.conf.d/piper.conf && \
     ldconfig && \
-    chmod +x /usr/local/bin/piper && \
     rm -rf piper.tar.gz piper/
 
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/opt/piper/lib:$LD_LIBRARY_PATH
 
 EXPOSE $PORT
 
