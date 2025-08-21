@@ -263,9 +263,11 @@ async def get_configuration():
             "description": f"Standard endpoint supports up to {MAX_TEXT_LENGTH:,} chars. Use /synthesize_long for longer texts."
         },
         "performance": {
-            "timeout_standard": "30s",
-            "timeout_long": "60s per chunk",
-            "chunking_enabled": True
+            "timeout_standard": "60-120s (dynamic based on text length)",
+            "timeout_long": "90-180s per chunk (dynamic)",
+            "timeout_calculation": "Dynamic: longer texts get more time",
+            "chunking_enabled": True,
+            "max_chunk_size": "4,000 characters"
         },
         "voices": {
             "total_loaded": len(VOICES_CACHE),
@@ -315,13 +317,14 @@ async def synthesize_speech(request: SynthesisRequest):
         
         logger.info(f"Synthesizing: '{text[:50]}...' with voice '{request.voice}'")
         
-        # Run Piper binary
+        # Run Piper binary with increased timeout for longer texts
+        timeout_duration = min(120, max(60, len(text) // 100))  # Dynamic timeout: 60-120s based on text length
         result = subprocess.run(
             cmd,
             input=text,
             text=True,
             capture_output=True,
-            timeout=30,
+            timeout=timeout_duration,
             check=False
         )
         
@@ -354,8 +357,11 @@ async def synthesize_speech(request: SynthesisRequest):
         )
         
     except subprocess.TimeoutExpired:
-        logger.error("Piper synthesis timeout")
-        raise HTTPException(status_code=504, detail="Synthesis timeout (30s limit)")
+        logger.error(f"Piper synthesis timeout for text length: {len(text)} chars")
+        raise HTTPException(
+            status_code=504, 
+            detail=f"Synthesis timeout - text may be too long ({len(text):,} chars). Try /synthesize_long for very long texts."
+        )
     except Exception as e:
         logger.error(f"Synthesis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {str(e)}")
@@ -415,13 +421,14 @@ async def synthesize_long_text(request: SynthesisRequest):
             if voice_info.num_speakers > 1 and request.speaker_id is not None:
                 cmd.extend(["--speaker", str(request.speaker_id)])
             
-            # Run Piper binary for this chunk
+            # Run Piper binary for this chunk with dynamic timeout
+            chunk_timeout = min(180, max(90, len(chunk) // 50))  # 90-180s based on chunk length
             result = subprocess.run(
                 cmd,
                 input=chunk,
                 text=True,
                 capture_output=True,
-                timeout=60,  # Longer timeout for long texts
+                timeout=chunk_timeout,
                 check=False
             )
             
@@ -470,8 +477,11 @@ async def synthesize_long_text(request: SynthesisRequest):
         )
         
     except subprocess.TimeoutExpired:
-        logger.error("Piper synthesis timeout on long text")
-        raise HTTPException(status_code=504, detail="Synthesis timeout - text may be too long")
+        logger.error(f"Piper synthesis timeout on long text ({len(text):,} chars, {len(chunks)} chunks)")
+        raise HTTPException(
+            status_code=504, 
+            detail=f"Synthesis timeout on long text ({len(text):,} chars). Consider splitting into smaller segments."
+        )
     except Exception as e:
         logger.error(f"Long text synthesis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Long text synthesis failed: {str(e)}")
