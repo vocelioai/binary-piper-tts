@@ -43,7 +43,7 @@ MODELS_DIR = os.environ.get("MODELS_DIR") or DEFAULT_MODELS_DIR
 DEFAULT_PIPER_BINARY = "/usr/local/bin/piper" if os.name != "nt" else os.path.join(os.path.dirname(__file__), "piper-bin", "piper", "piper.exe")
 PIPER_BINARY = os.environ.get("PIPER_BINARY") or DEFAULT_PIPER_BINARY
 
-MAX_TEXT_LENGTH = 1000
+MAX_TEXT_LENGTH = 20000  # Increased for call center use - supports long conversations
 
 logger.info(f"Resolved MODELS_DIR={MODELS_DIR}")
 logger.info(f"Resolved PIPER_BINARY={PIPER_BINARY}")
@@ -98,7 +98,7 @@ def load_voices():
                     logger.error(f"Error loading config for {voice_name}: {e}")
 
 def validate_text_input(text: str) -> str:
-    """Validate and sanitize text input"""
+    """Validate and sanitize text input - supports long call center conversations"""
     if not text or not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
@@ -106,10 +106,54 @@ def validate_text_input(text: str) -> str:
     if len(text) > MAX_TEXT_LENGTH:
         raise HTTPException(
             status_code=400, 
-            detail=f"Text too long. Maximum {MAX_TEXT_LENGTH} characters allowed"
+            detail=f"Text too long. Maximum {MAX_TEXT_LENGTH:,} characters allowed (current: {len(text):,}). For longer texts, consider splitting into multiple requests."
         )
     
     return text
+
+def chunk_long_text(text: str, max_chunk_size: int = 5000) -> List[str]:
+    """Split long text into chunks at sentence boundaries for better TTS quality"""
+    if len(text) <= max_chunk_size:
+        return [text]
+    
+    # Split on sentence endings, preserving the punctuation
+    import re
+    sentences = re.split(r'([.!?]+\s*)', text)
+    
+    chunks = []
+    current_chunk = ""
+    
+    i = 0
+    while i < len(sentences):
+        sentence = sentences[i]
+        
+        # Add sentence and its punctuation if it exists
+        potential_chunk = current_chunk + sentence
+        if i + 1 < len(sentences) and sentences[i + 1].strip() in '.!?':
+            potential_chunk += sentences[i + 1]
+            i += 1
+        
+        if len(potential_chunk) <= max_chunk_size:
+            current_chunk = potential_chunk
+        else:
+            # Current chunk is full, start a new one
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+                if i + 1 < len(sentences) and sentences[i + 1].strip() in '.!?':
+                    current_chunk += sentences[i + 1]
+                    i += 1
+            else:
+                # Single sentence is too long, force split
+                chunks.append(sentence[:max_chunk_size].strip())
+                current_chunk = sentence[max_chunk_size:]
+        
+        i += 1
+    
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return [chunk for chunk in chunks if chunk.strip()]
 
 def validate_voice_id(voice_id: str) -> VoiceInfo:
     """Validate voice ID and return voice info"""
@@ -148,12 +192,15 @@ async def api_info():
         "voices_loaded": len(VOICES_CACHE),
         "available_voices": list(VOICES_CACHE.keys()),
         "piper_binary": PIPER_BINARY,
+        "text_limit": f"{MAX_TEXT_LENGTH:,} characters",
         "endpoints": {
-            "voices": "/voices",
-            "synthesize": "/synthesize",
-            "health": "/health",
-            "web_ui": "/",
-            "api_info": "/api"
+            "voices": "/voices - List available voices",
+            "synthesize": "/synthesize - Standard synthesis (up to 20K chars)",
+            "synthesize_long": "/synthesize_long - Long text with chunking",
+            "config": "/config - Service configuration",
+            "health": "/health - Health check",
+            "web_ui": "/ - Web interface",
+            "api_info": "/api - This endpoint"
         }
     }
 
@@ -201,6 +248,35 @@ async def get_voice_details(voice_id: str):
         "supports_multiple_speakers": voice_info.num_speakers > 1,
         "model_path": voice_info.model_path,
         "config_path": voice_info.config_path
+    }
+
+@app.get("/config")
+async def get_configuration():
+    """Get current TTS service configuration"""
+    return {
+        "service": "Binary Piper TTS",
+        "version": "1.0.0",
+        "text_limits": {
+            "max_length": MAX_TEXT_LENGTH,
+            "max_length_formatted": f"{MAX_TEXT_LENGTH:,}",
+            "chunk_size": 4000,
+            "description": f"Standard endpoint supports up to {MAX_TEXT_LENGTH:,} chars. Use /synthesize_long for longer texts."
+        },
+        "performance": {
+            "timeout_standard": "30s",
+            "timeout_long": "60s per chunk",
+            "chunking_enabled": True
+        },
+        "voices": {
+            "total_loaded": len(VOICES_CACHE),
+            "languages_supported": len(set(voice.language for voice in VOICES_CACHE.values()))
+        },
+        "endpoints": {
+            "synthesize": "Standard synthesis (up to 20,000 chars)",
+            "synthesize_long": "Long text synthesis with automatic chunking",
+            "voices": "List available voices",
+            "health": "Service health check"
+        }
     }
 
 @app.post("/synthesize")
@@ -283,6 +359,122 @@ async def synthesize_speech(request: SynthesisRequest):
     except Exception as e:
         logger.error(f"Synthesis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {str(e)}")
+    finally:
+        # Cleanup temporary files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp file {temp_file}: {e}")
+
+@app.post("/synthesize_long")
+async def synthesize_long_text(request: SynthesisRequest):
+    """
+    Synthesize very long text by automatically chunking it and combining audio
+    Perfect for call center scripts, long conversations, or detailed announcements
+    """
+    
+    # Basic validation
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    text = request.text.strip()
+    voice_info = validate_voice_id(request.voice)
+    
+    # For very long texts, use chunking
+    if len(text) > 5000:
+        logger.info(f"Long text detected ({len(text):,} chars), using chunking approach")
+        chunks = chunk_long_text(text, max_chunk_size=4000)
+        logger.info(f"Split into {len(chunks)} chunks")
+    else:
+        chunks = [text]
+    
+    temp_files = []
+    audio_chunks = []
+    
+    try:
+        # Process each chunk
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+            
+            # Create temporary output file for this chunk
+            with tempfile.NamedTemporaryFile(suffix=f'_chunk_{i}.wav', delete=False) as audio_file:
+                audio_file_path = audio_file.name
+                temp_files.append(audio_file_path)
+            
+            # Build Piper command
+            cmd = [
+                PIPER_BINARY,
+                "--model", voice_info.model_path,
+                "--config", voice_info.config_path,
+                "--output_file", audio_file_path
+            ]
+            
+            # Add speaker ID if voice supports multiple speakers
+            if voice_info.num_speakers > 1 and request.speaker_id is not None:
+                cmd.extend(["--speaker", str(request.speaker_id)])
+            
+            # Run Piper binary for this chunk
+            result = subprocess.run(
+                cmd,
+                input=chunk,
+                text=True,
+                capture_output=True,
+                timeout=60,  # Longer timeout for long texts
+                check=False
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr or "Unknown Piper error"
+                logger.error(f"Piper failed on chunk {i+1}: {error_msg}")
+                raise HTTPException(status_code=500, detail=f"Synthesis failed on chunk {i+1}: {error_msg}")
+            
+            # Check if output file was created
+            if not os.path.exists(audio_file_path) or os.path.getsize(audio_file_path) == 0:
+                raise HTTPException(status_code=500, detail=f"No audio output generated for chunk {i+1}")
+            
+            # Read generated audio chunk
+            with open(audio_file_path, 'rb') as f:
+                chunk_data = f.read()
+                audio_chunks.append(chunk_data)
+        
+        # Combine all audio chunks (simple concatenation for WAV files)
+        if len(audio_chunks) == 1:
+            combined_audio = audio_chunks[0]
+        else:
+            # For multiple chunks, we'll use simple binary concatenation
+            # This works for WAV files with identical headers
+            combined_audio = audio_chunks[0]  # Start with first chunk (includes WAV header)
+            
+            # Append data from subsequent chunks (skip their WAV headers)
+            for chunk_data in audio_chunks[1:]:
+                if len(chunk_data) > 44:  # WAV header is typically 44 bytes
+                    combined_audio += chunk_data[44:]  # Skip WAV header, append audio data
+        
+        logger.info(f"Successfully synthesized {len(combined_audio):,} bytes from {len(chunks)} chunks")
+        
+        # Return combined audio
+        return StreamingResponse(
+            io.BytesIO(combined_audio),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": f"attachment; filename=long_speech_{request.voice}.wav",
+                "Content-Length": str(len(combined_audio)),
+                "X-Voice-Used": request.voice,
+                "X-Speaker-ID": str(request.speaker_id or 0),
+                "X-Text-Length": str(len(text)),
+                "X-Chunks-Used": str(len(chunks)),
+                "X-Long-Text-Mode": "true"
+            }
+        )
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Piper synthesis timeout on long text")
+        raise HTTPException(status_code=504, detail="Synthesis timeout - text may be too long")
+    except Exception as e:
+        logger.error(f"Long text synthesis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Long text synthesis failed: {str(e)}")
     finally:
         # Cleanup temporary files
         for temp_file in temp_files:
