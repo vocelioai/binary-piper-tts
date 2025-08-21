@@ -4,6 +4,7 @@ import tempfile
 import subprocess
 import json
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query
@@ -263,11 +264,12 @@ async def get_configuration():
             "description": f"Standard endpoint supports up to {MAX_TEXT_LENGTH:,} chars. Use /synthesize_long for longer texts."
         },
         "performance": {
-            "timeout_standard": "60-120s (dynamic based on text length)",
-            "timeout_long": "90-180s per chunk (dynamic)",
-            "timeout_calculation": "Dynamic: longer texts get more time",
+            "timeout_standard": "120-300s (generous, length-based)",
+            "timeout_long": "180-600s per chunk (very generous)",
+            "timeout_formula": "Standard: 120s + (chars÷50), Long: 180s + (chars÷25)",
             "chunking_enabled": True,
-            "max_chunk_size": "4,000 characters"
+            "max_chunk_size": "4,000 characters",
+            "synthesis_logging": "Enabled with timing details"
         },
         "voices": {
             "total_loaded": len(VOICES_CACHE),
@@ -317,8 +319,12 @@ async def synthesize_speech(request: SynthesisRequest):
         
         logger.info(f"Synthesizing: '{text[:50]}...' with voice '{request.voice}'")
         
-        # Run Piper binary with increased timeout for longer texts
-        timeout_duration = min(120, max(60, len(text) // 100))  # Dynamic timeout: 60-120s based on text length
+        # Run Piper binary with generous timeout for longer texts
+        # More generous formula: base 120s + extra time for longer texts
+        timeout_duration = min(300, max(120, 120 + (len(text) // 50)))  # 120-300s based on text length
+        logger.info(f"Using timeout: {timeout_duration}s for {len(text)} characters")
+        
+        start_time = time.time()
         result = subprocess.run(
             cmd,
             input=text,
@@ -327,6 +333,8 @@ async def synthesize_speech(request: SynthesisRequest):
             timeout=timeout_duration,
             check=False
         )
+        synthesis_time = time.time() - start_time
+        logger.info(f"Synthesis completed in {synthesis_time:.2f}s")
         
         if result.returncode != 0:
             error_msg = result.stderr or "Unknown Piper error"
@@ -421,8 +429,12 @@ async def synthesize_long_text(request: SynthesisRequest):
             if voice_info.num_speakers > 1 and request.speaker_id is not None:
                 cmd.extend(["--speaker", str(request.speaker_id)])
             
-            # Run Piper binary for this chunk with dynamic timeout
-            chunk_timeout = min(180, max(90, len(chunk) // 50))  # 90-180s based on chunk length
+            # Run Piper binary for this chunk with generous timeout
+            # More generous for chunks: base 180s + extra for longer chunks
+            chunk_timeout = min(600, max(180, 180 + (len(chunk) // 25)))  # 180-600s based on chunk length
+            logger.info(f"Processing chunk {i+1}/{len(chunks)} with timeout: {chunk_timeout}s")
+            
+            chunk_start = time.time()
             result = subprocess.run(
                 cmd,
                 input=chunk,
@@ -431,6 +443,8 @@ async def synthesize_long_text(request: SynthesisRequest):
                 timeout=chunk_timeout,
                 check=False
             )
+            chunk_time = time.time() - chunk_start
+            logger.info(f"Chunk {i+1} completed in {chunk_time:.2f}s")
             
             if result.returncode != 0:
                 error_msg = result.stderr or "Unknown Piper error"
@@ -534,6 +548,45 @@ async def health_check():
     }
     
     return health_status
+
+@app.get("/test-performance")
+async def test_performance():
+    """Test performance and timeout calculations without synthesis"""
+    test_texts = [
+        ("Short text", "Hello world, this is a test.", 100),
+        ("Medium text", "This is a medium length text for testing." * 10, 1000),
+        ("Long text", "This is a longer text for performance testing." * 50, 5000),
+        ("Very long text", "This text simulates a long call center script." * 100, 15000)
+    ]
+    
+    results = []
+    for name, text, expected_chars in test_texts:
+        actual_chars = len(text)
+        timeout_standard = min(300, max(120, 120 + (actual_chars // 50)))
+        timeout_long = min(600, max(180, 180 + (actual_chars // 25)))
+        
+        results.append({
+            "test_name": name,
+            "text_length": actual_chars,
+            "expected_length": expected_chars,
+            "timeout_standard": f"{timeout_standard}s",
+            "timeout_long": f"{timeout_long}s",
+            "estimated_synthesis_time": f"{actual_chars // 500}-{actual_chars // 200}s"
+        })
+    
+    return {
+        "service": "Binary Piper TTS Performance Test",
+        "test_results": results,
+        "timeout_formulas": {
+            "standard": "min(300, max(120, 120 + (chars÷50)))",
+            "long_text": "min(600, max(180, 180 + (chars÷25)))"
+        },
+        "recommendations": {
+            "under_5000_chars": "Use /synthesize endpoint",
+            "over_5000_chars": "Use /synthesize_long endpoint",
+            "very_long_texts": "Consider splitting into smaller requests"
+        }
+    }
 
 @app.get("/reload-voices")
 async def reload_voices():
