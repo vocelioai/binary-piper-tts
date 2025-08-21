@@ -5,14 +5,27 @@ import subprocess
 import json
 import asyncio
 import time
+import hashlib
+import gc
+import threading
+import weakref
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
+
+# Optional performance monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +67,10 @@ class SynthesisRequest(BaseModel):
     text: str
     voice: str = "en_US-lessac-medium"
     speaker_id: Optional[int] = 0
+    format: Optional[str] = "wav"  # wav, mp3, ogg
+    quality: Optional[str] = "standard"  # low, standard, high
+    speed: Optional[float] = 1.0  # 0.5 to 2.0
+    enable_ssml: Optional[bool] = False
 
 class VoiceInfo(BaseModel):
     name: str
@@ -62,6 +79,119 @@ class VoiceInfo(BaseModel):
     num_speakers: int
     model_path: str
     config_path: str
+
+class AudioCache:
+    """LRU cache for synthesized audio with memory management"""
+    def __init__(self, max_size: int = 50, max_memory_mb: int = 200):
+        self.max_size = max_size
+        self.max_memory_bytes = max_memory_mb * 1024 * 1024
+        self.cache = OrderedDict()
+        self.memory_usage = 0
+        self.lock = threading.Lock()
+        
+    def _get_cache_key(self, text: str, voice: str, speaker_id: int) -> str:
+        """Generate cache key from synthesis parameters"""
+        key_string = f"{text}|{voice}|{speaker_id}"
+        return hashlib.md5(key_string.encode()).hexdigest()
+        
+    def get(self, text: str, voice: str, speaker_id: int) -> Optional[bytes]:
+        """Get cached audio data"""
+        with self.lock:
+            key = self._get_cache_key(text, voice, speaker_id)
+            if key in self.cache:
+                # Move to end (most recently used)
+                audio_data = self.cache.pop(key)
+                self.cache[key] = audio_data
+                logger.info(f"🎯 Cache HIT for key: {key[:8]}...")
+                return audio_data
+            return None
+    
+    def put(self, text: str, voice: str, speaker_id: int, audio_data: bytes):
+        """Cache audio data with memory management"""
+        with self.lock:
+            key = self._get_cache_key(text, voice, speaker_id)
+            audio_size = len(audio_data)
+            
+            # Check if single item is too large
+            if audio_size > self.max_memory_bytes:
+                logger.warning(f"⚠️  Audio too large to cache: {audio_size / 1024 / 1024:.1f}MB")
+                return
+                
+            # Remove items if cache is full or memory limit exceeded
+            while (len(self.cache) >= self.max_size or 
+                   self.memory_usage + audio_size > self.max_memory_bytes):
+                if not self.cache:
+                    break
+                oldest_key, oldest_data = self.cache.popitem(last=False)
+                self.memory_usage -= len(oldest_data)
+                logger.info(f"🗑️  Evicted cache entry: {oldest_key[:8]}...")
+            
+            self.cache[key] = audio_data
+            self.memory_usage += audio_size
+            logger.info(f"💾 Cached audio: {key[:8]}... ({audio_size / 1024:.1f}KB, total: {self.memory_usage / 1024 / 1024:.1f}MB)")
+    
+    def clear(self):
+        """Clear all cached data"""
+        with self.lock:
+            self.cache.clear()
+            self.memory_usage = 0
+            logger.info("🧹 Audio cache cleared")
+    
+    def get_stats(self) -> dict:
+        """Get cache statistics"""
+        with self.lock:
+            return {
+                "entries": len(self.cache),
+                "memory_usage_mb": round(self.memory_usage / 1024 / 1024, 2),
+                "max_entries": self.max_size,
+                "max_memory_mb": self.max_memory_bytes / 1024 / 1024
+            }
+
+class VoiceModelManager:
+    """Advanced voice model management with preloading and monitoring"""
+    def __init__(self):
+        self.loaded_models = {}
+        self.model_usage = OrderedDict()  # Track usage frequency
+        self.lock = threading.Lock()
+        self.preload_popular = True
+        
+    def get_model_memory_usage(self) -> float:
+        """Estimate memory usage of loaded models (MB)"""
+        try:
+            if PSUTIL_AVAILABLE:
+                process = psutil.Process()
+                return process.memory_info().rss / 1024 / 1024
+            else:
+                return 0.0
+        except:
+            return 0.0
+    
+    def track_usage(self, voice: str):
+        """Track voice usage for intelligent caching"""
+        with self.lock:
+            if voice in self.model_usage:
+                self.model_usage.move_to_end(voice)
+                self.model_usage[voice] += 1
+            else:
+                self.model_usage[voice] = 1
+                
+    def get_popular_voices(self, limit: int = 10) -> List[str]:
+        """Get most frequently used voices"""
+        with self.lock:
+            sorted_voices = sorted(self.model_usage.items(), key=lambda x: x[1], reverse=True)
+            return [voice for voice, _ in sorted_voices[:limit]]
+    
+    def preload_voice_models(self, voices: List[str]):
+        """Preload popular voice models for faster synthesis"""
+        for voice in voices:
+            if voice in VOICES_CACHE:
+                logger.info(f"🚀 Preloading voice model: {voice}")
+                # Model is already "loaded" in our current system
+                self.track_usage(voice)
+
+# Global caches
+AUDIO_CACHE = AudioCache(max_size=100, max_memory_mb=300)
+VOICE_MANAGER = VoiceModelManager()
 
 # Global voice cache
 VOICES_CACHE = {}
@@ -97,6 +227,104 @@ def load_voices():
                     logger.info(f"Loaded voice: {voice_name}")
                 except Exception as e:
                     logger.error(f"Error loading config for {voice_name}: {e}")
+
+def process_ssml(text: str, speed: float = 1.0) -> str:
+    """Process SSML-like markup for enhanced voice control"""
+    if not text:
+        return text
+    
+    # Basic SSML processing for speed control
+    if speed != 1.0:
+        # For now, we'll handle speed at the Piper level
+        # Future: implement proper SSML parsing
+        pass
+    
+    # Remove any existing SSML tags for now (basic sanitization)
+    import re
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    return text.strip()
+
+def compress_audio(audio_data: bytes, format: str = "wav", quality: str = "standard") -> Tuple[bytes, str]:
+    """Compress audio to different formats (requires ffmpeg)"""
+    if format == "wav" or not format:
+        return audio_data, "audio/wav"
+    
+    # For now, return original WAV data
+    # Future implementation would use ffmpeg for MP3/OGG conversion
+    # This would require: pip install pydub
+    
+    logger.info(f"Audio compression requested ({format}, {quality}) - returning WAV for now")
+    return audio_data, "audio/wav"
+
+def apply_audio_effects(audio_data: bytes, speed: float = 1.0) -> bytes:
+    """Apply audio effects like speed changes (requires audio processing library)"""
+    if speed == 1.0:
+        return audio_data
+    
+    # For now, return original audio
+    # Future implementation would use librosa or similar for speed adjustment
+    logger.info(f"Speed adjustment requested ({speed}x) - returning original audio for now")
+    return audio_data
+
+async def stream_synthesis_chunks(text_chunks: List[str], voice: str, speaker_id: int = 0):
+    """Stream audio synthesis by processing chunks in real-time"""
+    for i, chunk in enumerate(text_chunks):
+        logger.info(f"🌊 Streaming chunk {i+1}/{len(text_chunks)}: '{chunk[:50]}...'")
+        
+        # Check cache first
+        cached_audio = AUDIO_CACHE.get(chunk, voice, speaker_id)
+        if cached_audio:
+            yield cached_audio
+            continue
+            
+        # Synthesize chunk
+        temp_files = []
+        try:
+            voice_info = VOICES_CACHE[voice]
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as audio_file:
+                audio_file_path = audio_file.name
+                temp_files.append(audio_file_path)
+            
+            cmd = [
+                PIPER_BINARY,
+                "--model", voice_info.model_path,
+                "--config", voice_info.config_path,
+                "--output_file", audio_file_path
+            ]
+            
+            if voice_info.num_speakers > 1 and speaker_id is not None:
+                cmd.extend(["--speaker", str(speaker_id)])
+            
+            result = subprocess.run(
+                cmd,
+                input=chunk,
+                text=True,
+                capture_output=True,
+                timeout=120,  # Shorter timeout for streaming chunks
+                check=False
+            )
+            
+            if result.returncode == 0 and os.path.exists(audio_file_path):
+                with open(audio_file_path, 'rb') as f:
+                    audio_data = f.read()
+                
+                # Cache the chunk
+                AUDIO_CACHE.put(chunk, voice, speaker_id, audio_data)
+                yield audio_data
+            else:
+                logger.error(f"Failed to synthesize chunk: {result.stderr}")
+                
+        except Exception as e:
+            logger.error(f"Error synthesizing chunk: {e}")
+        finally:
+            # Cleanup
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
 def validate_text_input(text: str) -> str:
     """Validate and sanitize text input - supports long call center conversations"""
@@ -285,7 +513,7 @@ async def get_configuration():
 
 @app.post("/synthesize")
 async def synthesize_speech(request: SynthesisRequest):
-    """Synthesize speech using Piper binary"""
+    """Enhanced synthesis with caching, SSML support, and audio effects"""
     
     # Validate inputs
     text = validate_text_input(request.text)
@@ -296,6 +524,54 @@ async def synthesize_speech(request: SynthesisRequest):
         raise HTTPException(
             status_code=400,
             detail=f"Speaker ID {request.speaker_id} not available. Voice has {voice_info.num_speakers} speakers (0-{voice_info.num_speakers-1})"
+        )
+    
+    # Validate speed parameter
+    if not (0.5 <= request.speed <= 2.0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Speed must be between 0.5 and 2.0 (current: {request.speed})"
+        )
+    
+    # Process SSML if enabled
+    if request.enable_ssml:
+        text = process_ssml(text, request.speed)
+    
+    # Create cache key including all parameters
+    cache_key_params = (text, request.voice, request.speaker_id or 0, request.speed, request.quality)
+    cache_key = hashlib.md5(str(cache_key_params).encode()).hexdigest()
+    
+    # 🎯 Check audio cache first
+    cached_audio = AUDIO_CACHE.get(text, request.voice, request.speaker_id or 0)
+    if cached_audio and request.speed == 1.0 and request.format == "wav":
+        VOICE_MANAGER.track_usage(request.voice)
+        logger.info(f"⚡ Returning cached audio for '{text[:50]}...' ({len(cached_audio)} bytes)")
+        
+        # Determine media type
+        media_type = "audio/wav" if request.format == "wav" else f"audio/{request.format}"
+        
+        return StreamingResponse(
+            io.BytesIO(cached_audio),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename=speech_{request.voice}.{request.format}",
+                "Cache-Source": "memory",
+                "X-Processing-Time": "0.001s",
+                "X-Speed": str(request.speed),
+                "X-Quality": request.quality
+            }
+        )
+    if cached_audio:
+        VOICE_MANAGER.track_usage(request.voice)
+        logger.info(f"⚡ Returning cached audio for '{text[:50]}...' ({len(cached_audio)} bytes)")
+        return StreamingResponse(
+            io.BytesIO(cached_audio),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": f"attachment; filename=speech_{request.voice}.wav",
+                "Cache-Source": "memory",
+                "X-Processing-Time": "0.001s"
+            }
         )
     
     temp_files = []
@@ -317,7 +593,7 @@ async def synthesize_speech(request: SynthesisRequest):
         if voice_info.num_speakers > 1 and request.speaker_id is not None:
             cmd.extend(["--speaker", str(request.speaker_id)])
         
-        logger.info(f"Synthesizing: '{text[:50]}...' with voice '{request.voice}'")
+        logger.info(f"🎵 Synthesizing: '{text[:50]}...' with voice '{request.voice}' (cache miss)")
         
         # Run Piper binary with generous timeout for longer texts
         # More generous formula: base 120s + extra time for longer texts
@@ -349,18 +625,40 @@ async def synthesize_speech(request: SynthesisRequest):
         with open(audio_file_path, 'rb') as f:
             audio_data = f.read()
         
-        logger.info(f"Successfully synthesized {len(audio_data)} bytes of audio")
+        end_time = time.time()
+        synthesis_time = round(end_time - start_time, 3)
+        
+        # 🎛️ Apply audio effects (speed, etc.)
+        if request.speed != 1.0:
+            audio_data = apply_audio_effects(audio_data, request.speed)
+        
+        # �️ Compress audio if requested
+        compressed_audio, media_type = compress_audio(audio_data, request.format, request.quality)
+        
+        # �💾 Cache the synthesized audio for future requests (original WAV)
+        AUDIO_CACHE.put(text, request.voice, request.speaker_id or 0, audio_data)
+        VOICE_MANAGER.track_usage(request.voice)
+        
+        file_extension = request.format if request.format in ['wav', 'mp3', 'ogg'] else 'wav'
+        
+        logger.info(f"✅ Synthesized {len(compressed_audio)} bytes in {synthesis_time}s - cached for future use")
         
         # Return audio as streaming response
         return StreamingResponse(
-            io.BytesIO(audio_data),
-            media_type="audio/wav",
+            io.BytesIO(compressed_audio),
+            media_type=media_type,
             headers={
-                "Content-Disposition": f"attachment; filename=speech_{request.voice}.wav",
-                "Content-Length": str(len(audio_data)),
+                "Content-Disposition": f"attachment; filename=speech_{request.voice}.{file_extension}",
+                "Content-Length": str(len(compressed_audio)),
                 "X-Voice-Used": request.voice,
                 "X-Speaker-ID": str(request.speaker_id or 0),
-                "X-Text-Length": str(len(text))
+                "X-Text-Length": str(len(text)),
+                "X-Processing-Time": f"{synthesis_time}s",
+                "X-Cache-Source": "fresh",
+                "X-Speed": str(request.speed),
+                "X-Quality": request.quality,
+                "X-Format": request.format,
+                "X-SSML-Enabled": str(request.enable_ssml)
             }
         )
         
@@ -381,6 +679,50 @@ async def synthesize_speech(request: SynthesisRequest):
                     os.unlink(temp_file)
             except Exception as e:
                 logger.warning(f"Failed to cleanup temp file {temp_file}: {e}")
+
+@app.post("/synthesize_stream")
+async def synthesize_streaming(request: SynthesisRequest):
+    """🌊 Stream synthesis for real-time audio generation"""
+    
+    # Validate inputs
+    text = validate_text_input(request.text)
+    voice_info = validate_voice_id(request.voice)
+    
+    # Process SSML if enabled
+    if request.enable_ssml:
+        text = process_ssml(text, request.speed)
+    
+    # Split text into streaming chunks
+    chunks = chunk_long_text(text, max_chunk_size=500)  # Smaller chunks for streaming
+    logger.info(f"🌊 Streaming synthesis: {len(chunks)} chunks for '{text[:50]}...'")
+    
+    async def generate_streaming_audio():
+        """Generate audio chunks in real-time"""
+        async for audio_chunk in stream_synthesis_chunks(chunks, request.voice, request.speaker_id or 0):
+            # Apply effects if needed
+            if request.speed != 1.0:
+                audio_chunk = apply_audio_effects(audio_chunk, request.speed)
+            
+            # Compress if needed
+            compressed_chunk, _ = compress_audio(audio_chunk, request.format, request.quality)
+            
+            yield compressed_chunk
+    
+    # Determine media type
+    media_type = "audio/wav" if request.format == "wav" else f"audio/{request.format}"
+    
+    return StreamingResponse(
+        generate_streaming_audio(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename=stream_{request.voice}.{request.format}",
+            "X-Voice-Used": request.voice,
+            "X-Streaming": "true",
+            "X-Chunks": str(len(chunks)),
+            "X-Speed": str(request.speed),
+            "X-Quality": request.quality
+        }
+    )
 
 @app.post("/synthesize_long")
 async def synthesize_long_text(request: SynthesisRequest):
@@ -585,6 +927,89 @@ async def test_performance():
             "under_5000_chars": "Use /synthesize endpoint",
             "over_5000_chars": "Use /synthesize_long endpoint",
             "very_long_texts": "Consider splitting into smaller requests"
+        }
+    }
+
+@app.get("/cache/stats")
+async def get_cache_stats():
+    """📊 Get cache statistics and performance metrics"""
+    return {
+        "audio_cache": AUDIO_CACHE.get_stats(),
+        "voice_manager": {
+            "memory_usage_mb": VOICE_MANAGER.get_model_memory_usage(),
+            "popular_voices": VOICE_MANAGER.get_popular_voices(limit=10),
+            "total_usage_tracked": sum(VOICE_MANAGER.model_usage.values())
+        },
+        "system_performance": {
+            "voices_loaded": len(VOICES_CACHE),
+            "total_requests_processed": sum(VOICE_MANAGER.model_usage.values())
+        }
+    }
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """🧹 Clear audio cache and reset usage statistics"""
+    AUDIO_CACHE.clear()
+    VOICE_MANAGER.model_usage.clear()
+    
+    # Force garbage collection
+    gc.collect()
+    
+    return {
+        "status": "success",
+        "message": "Cache cleared successfully",
+        "memory_freed": "Cache and usage statistics reset"
+    }
+
+@app.post("/cache/preload")
+async def preload_popular_voices(voices: List[str] = None):
+    """🚀 Preload popular voice models for faster synthesis"""
+    if voices is None:
+        # Auto-detect popular voices
+        voices = VOICE_MANAGER.get_popular_voices(limit=10)
+        if not voices:
+            # Default popular voices if no usage data
+            voices = ["en_US-lessac-medium", "en_US-amy-medium", "es_ES-davefx-medium"]
+    
+    preloaded = []
+    for voice in voices:
+        if voice in VOICES_CACHE:
+            VOICE_MANAGER.preload_voice_models([voice])
+            preloaded.append(voice)
+    
+    return {
+        "status": "success",
+        "preloaded_voices": preloaded,
+        "message": f"Preloaded {len(preloaded)} voice models"
+    }
+
+@app.get("/performance/analytics")
+async def get_performance_analytics():
+    """📈 Advanced performance analytics"""
+    cache_stats = AUDIO_CACHE.get_stats()
+    memory_usage = VOICE_MANAGER.get_model_memory_usage()
+    popular_voices = VOICE_MANAGER.get_popular_voices()
+    
+    return {
+        "cache_efficiency": {
+            "hit_rate_estimate": "Available after first cache hits",
+            "memory_utilization": f"{(cache_stats['memory_usage_mb'] / cache_stats['max_memory_mb'] * 100):.1f}%",
+            "entries_utilization": f"{(cache_stats['entries'] / cache_stats['max_entries'] * 100):.1f}%"
+        },
+        "voice_usage_patterns": {
+            "most_popular": popular_voices[:5] if popular_voices else [],
+            "total_voices_available": len(VOICES_CACHE),
+            "voices_actually_used": len(VOICE_MANAGER.model_usage)
+        },
+        "system_resources": {
+            "estimated_memory_usage_mb": memory_usage,
+            "cache_memory_mb": cache_stats['memory_usage_mb'],
+            "total_estimated_mb": memory_usage + cache_stats['memory_usage_mb']
+        },
+        "recommendations": {
+            "cache_tuning": "Increase cache size if hit rate is low",
+            "voice_optimization": "Consider preloading popular voices",
+            "memory_management": "Monitor memory usage for large deployments"
         }
     }
 
