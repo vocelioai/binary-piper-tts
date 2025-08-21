@@ -3,24 +3,9 @@ builder = "dockerfile"
 
 [deploy]
 healthcheckPath = "/health"
-healthcheckTimeout = 300
+healthcheckTimeout = 600
 restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3
-
-[build.buildCommand]
-# Use Docker build (no additional build command needed)
 
 [variables]
-# Timezone configuration for global deployment
 TZ = "UTC"
-
-# Python configuration  
 PYTHONUNBUFFERED = "1"
-PYTHONDONTWRITEBYTECODE = "1"
-
-# Service configuration
-MAX_TEXT_LENGTH = "1000"
-LOG_LEVEL = "INFO"
-
-# Railway optimizations
-RAILWAY_HEALTHCHECK_TIMEOUT = "300"

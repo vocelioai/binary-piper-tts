@@ -1,0 +1,26 @@
+# Railway ignore file - exclude unnecessary files from deployment
+*.wav
+*.mp3
+*.flac
+*.log
+logs/
+temp/
+tmp/
+*.tmp
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+node_modules/
