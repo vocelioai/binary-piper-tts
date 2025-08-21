@@ -28,5 +28,5 @@ ENV LD_LIBRARY_PATH=/opt/piper/lib:$LD_LIBRARY_PATH
 
 EXPOSE $PORT
 
-# Start with progressive download for maximum voices within time limits
-CMD python download_models_progressive.py && exec uvicorn app:app --host 0.0.0.0 --port $PORT
+# Start with enhanced download for 50+ voices within time limits
+CMD python download_models_enhanced.py && exec uvicorn app:app --host 0.0.0.0 --port $PORT
